@@ -30,12 +30,26 @@ exports.googleLogin = async (req, res) => {
 
     console.log("QUERY START");
 
-    // 1. Check if user already exists
+    // 1. Check if user already exists (including deleted ones)
     let userResult = await db.query('SELECT * FROM users WHERE email = $1 OR firebase_uid = $2 LIMIT 1', [email, firebase_uid]);
     console.log("result.rows:", userResult.rows);
 
     if (userResult.rows.length > 0) {
       const existingUser = userResult.rows[0];
+
+      if (existingUser.is_deleted) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account has been deleted.'
+        });
+      }
+
+      if (existingUser.is_active === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account has been deactivated by the administrator.'
+        });
+      }
 
       // SECURITY CONDITION: If user registered manually (with password) and tries to Google Login
       if (existingUser.auth_provider === 'email' && !existingUser.firebase_uid) {
@@ -80,7 +94,8 @@ exports.register = async (req, res) => {
   try {
     console.log("API HIT: /auth/register");
     console.log("req.body:", req.body);
-    let { name, email, password } = req.body;
+    let { name, email, password, mobile, phone } = req.body;
+    const userMobile = mobile || phone; // Handle both keys
 
     if (!email || !password) {
       return res.status(400).json({ success: false, message: 'Email and password are required' });
@@ -100,22 +115,33 @@ exports.register = async (req, res) => {
 
     if (existingEmail.rows.length > 0) {
       const existingUser = existingEmail.rows[0];
-      
-      if (existingUser.auth_provider === 'google') {
-        console.log('[register] User already registered via Google');
-        return res.status(400).json({ success: false, message: 'This email is already registered with Google. Please login with Google.' });
-      } else {
-        console.log('[register] User already registered manually');
-        return res.status(400).json({ success: false, message: 'User already registered with this email.' });
+
+      if (existingUser.is_deleted) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account has been deleted.'
+        });
       }
+
+      if (existingUser.is_active === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account has been deactivated by the administrator.'
+        });
+      }
+
+      return res.status(409).json({
+        success: false,
+        message: 'User already registered with this email.'
+      });
     }
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const newUserResult = await db.query(
-      'INSERT INTO users (name, email, password, auth_provider, current_balance, is_active) VALUES ($1, $2, $3, $4, 0, true) RETURNING *',
-      [name, email, hashedPassword, 'email']
+      'INSERT INTO users (name, email, password, mobile, auth_provider, current_balance, is_active) VALUES ($1, $2, $3, $4, $5, 0, true) RETURNING *',
+      [name, email, hashedPassword, userMobile, 'email']
     );
 
     const newUser = newUserResult.rows[0];
@@ -145,15 +171,29 @@ exports.login = async (req, res) => {
     email = email.trim().toLowerCase(); // Security/UX: Normalize email
 
     console.log("QUERY START");
+    // Find user by email (including deleted ones to check status)
     const userResult = await db.query('SELECT * FROM users WHERE email = $1', [email]);
     console.log("result.rows:", userResult.rows);
 
     if (userResult.rows.length === 0) {
-      console.log('[login] User not found');
-      return res.status(404).json({ success: false, message: 'User not found. Please register.' });
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
     const user = userResult.rows[0];
+
+    if (user.is_deleted) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your account has been deleted.'
+      });
+    }
+
+    if (user.is_active === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your account has been deactivated by the administrator.'
+      });
+    }
 
     if (!user.password) {
       return res.status(400).json({ success: false, message: 'Please login with Google' });

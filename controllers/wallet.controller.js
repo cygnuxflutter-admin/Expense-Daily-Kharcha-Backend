@@ -23,20 +23,9 @@ exports.addCredit = async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Get opening balance from last transaction
-    const lastTxResult = await client.query(
-      'SELECT closing_balance FROM wallet_transactions WHERE user_id = $1 ORDER BY expense_date DESC, created_at DESC LIMIT 1',
-      [userId]
-    );
-    
-    // Fallback to current_balance if no transactions exist
-    let openingBalance = 0;
-    if (lastTxResult.rows.length > 0) {
-      openingBalance = parseFloat(lastTxResult.rows[0].closing_balance) || 0;
-    } else {
-      const userResult = await client.query('SELECT current_balance FROM users WHERE id = $1', [userId]);
-      openingBalance = userResult.rows.length > 0 ? parseFloat(userResult.rows[0].current_balance) || 0 : 0;
-    }
+    // 1. Get current balance from users (source of truth)
+    const userResult = await client.query('SELECT current_balance FROM users WHERE id = $1', [userId]);
+    const openingBalance = userResult.rows.length > 0 ? parseFloat(userResult.rows[0].current_balance) || 0 : 0;
 
     const closingBalance = openingBalance + parsedAmount;
     console.log('[addCredit] opening_balance:', openingBalance, 'closing_balance:', closingBalance);
