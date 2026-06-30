@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 
 const generateToken = (user) => {
   return jwt.sign(
@@ -212,5 +213,109 @@ exports.login = async (req, res) => {
   } catch (error) {
     console.log("API ERROR:", error);
     return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============================================================
+// FORGOT PASSWORD - REQUEST OTP
+// ============================================================
+exports.forgotPassword = async (req, res) => {
+  const { email } = req.body;
+  try {
+    const userResult = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const user = userResult.rows[0];
+
+    // YOUR CONDITION: Block if Google Login user
+    if (user.auth_provider === 'google') {
+      return res.status(400).json({
+        success: false,
+        message: 'This account is linked with Google. You cannot change password here.'
+      });
+    }
+
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 10 * 60000); // 10 mins
+
+    await db.query(
+      'UPDATE users SET reset_otp = $1, otp_expiry = $2 WHERE id = $3',
+      [otp, expiry, user.id]
+    );
+
+    // Send Email (Configure these in your .env)
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      }
+    });
+
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Password Reset OTP - Kharcha App',
+      text: `Your OTP for password reset is: ${otp}. It is valid for 10 minutes.`
+    };
+
+    await transporter.sendMail(mailOptions);
+    return res.status(200).json({ success: true, message: 'OTP sent successfully to your email' });
+  } catch (error) {
+    console.error('[forgotPassword] ERROR:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+};
+
+// ============================================================
+// VERIFY OTP
+// ============================================================
+exports.verifyOTP = async (req, res) => {
+  const { email, otp } = req.body;
+  try {
+    const userResult = await db.query(
+      'SELECT * FROM users WHERE email = $1 AND reset_otp = $2 AND otp_expiry > NOW()',
+      [email, otp]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    return res.status(200).json({ success: true, message: 'OTP verified successfully' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// ============================================================
+// RESET PASSWORD
+// ============================================================
+exports.resetPassword = async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+  try {
+    const userResult = await db.query(
+      'SELECT * FROM users WHERE email = $1 AND reset_otp = $2 AND otp_expiry > NOW()',
+      [email, otp]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    await db.query(
+      'UPDATE users SET password = $1, reset_otp = NULL, otp_expiry = NULL WHERE id = $2',
+      [hashedPassword, userResult.rows[0].id]
+    );
+
+    return res.status(200).json({ success: true, message: 'Password reset successful' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
