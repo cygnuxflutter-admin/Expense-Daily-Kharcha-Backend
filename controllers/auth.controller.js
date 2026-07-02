@@ -1,13 +1,20 @@
 const db = require('../config/db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 
-const generateToken = (user) => {
+const generateAccessToken = (user) => {
   return jwt.sign(
     { id: user.id, email: user.email, role: user.role },
     process.env.JWT_SECRET || 'supersecretjwtkey1234567890',
-    { expiresIn: '30d' }
+    { expiresIn: '2d' } // Access Token set to 2 days as requested
+  );
+};
+
+const generateRefreshToken = (user) => {
+  return jwt.sign(
+    { id: user.id },
+    process.env.REFRESH_TOKEN_SECRET || 'refreshsecretkey987654321',
+    { expiresIn: '30d' } // Long-lived Refresh Token
   );
 };
 
@@ -67,9 +74,20 @@ exports.googleLogin = async (req, res) => {
         existingUser.firebase_uid = firebase_uid;
       }
 
-      const token = generateToken(existingUser);
+      const accessToken = generateAccessToken(existingUser);
+      const refreshToken = generateRefreshToken(existingUser);
+
+      // Store refresh token in DB
+      await db.query('UPDATE users SET refresh_token = $1 WHERE id = $2', [refreshToken, existingUser.id]);
+
       console.log("BEFORE RESPONSE");
-      return res.status(200).json({ success: true, message: 'Login successful', token, data: existingUser });
+      return res.status(200).json({
+        success: true,
+        message: 'Login successful',
+        token: accessToken,
+        refreshToken,
+        data: existingUser
+      });
     }
 
     // 2. User does not exist, create new
@@ -80,10 +98,20 @@ exports.googleLogin = async (req, res) => {
     );
 
     const newUser = newUserResult.rows[0];
-    const token = generateToken(newUser);
+    const accessToken = generateAccessToken(newUser);
+    const refreshToken = generateRefreshToken(newUser);
+
+    // Store refresh token in DB
+    await db.query('UPDATE users SET refresh_token = $1 WHERE id = $2', [refreshToken, newUser.id]);
 
     console.log("BEFORE RESPONSE");
-    return res.status(201).json({ success: true, message: 'User created', token, data: newUser });
+    return res.status(201).json({
+      success: true,
+      message: 'User created',
+      token: accessToken,
+      refreshToken,
+      data: newUser
+    });
   } catch (error) {
     console.log("API ERROR:", error);
     return res.status(500).json({ success: false, message: error.message });
@@ -148,10 +176,20 @@ exports.register = async (req, res) => {
     const newUser = newUserResult.rows[0];
     delete newUser.password; // Don't send password back
 
-    const token = generateToken(newUser);
+    const accessToken = generateAccessToken(newUser);
+    const refreshToken = generateRefreshToken(newUser);
+
+    // Store refresh token in DB
+    await db.query('UPDATE users SET refresh_token = $1 WHERE id = $2', [refreshToken, newUser.id]);
 
     console.log("BEFORE RESPONSE");
-    return res.status(201).json({ success: true, message: 'Registration successful', token, data: newUser });
+    return res.status(201).json({
+      success: true,
+      message: 'Registration successful',
+      token: accessToken,
+      refreshToken,
+      data: newUser
+    });
   } catch (error) {
     console.log("API ERROR:", error);
     return res.status(500).json({ success: false, message: error.message });
@@ -206,116 +244,93 @@ exports.login = async (req, res) => {
     }
 
     delete user.password;
-    const token = generateToken(user);
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+
+    // Store refresh token in DB
+    await db.query('UPDATE users SET refresh_token = $1 WHERE id = $2', [refreshToken, user.id]);
 
     console.log("BEFORE RESPONSE");
-    return res.status(200).json({ success: true, message: 'Login successful', token, data: user });
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      token: accessToken,
+      refreshToken,
+      data: user
+    });
   } catch (error) {
     console.log("API ERROR:", error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// ============================================================
-// FORGOT PASSWORD - REQUEST OTP
-// ============================================================
-exports.forgotPassword = async (req, res) => {
-  const { email } = req.body;
+// REFRESH TOKEN API
+exports.refreshToken = async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(401).json({ success: false, message: 'Refresh Token required' });
+  }
+
   try {
-    const userResult = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    // 1. Verify refresh token
+    const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET || 'refreshsecretkey987654321');
+
+    // 2. Check if token exists in DB and user is active
+    const userResult = await db.query(
+      'SELECT * FROM users WHERE id = $1 AND refresh_token = $2 AND is_active = true AND is_deleted = false',
+      [decoded.id, refreshToken]
+    );
+
     if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'User not found' });
+      // Return 401 as requested for invalid/revoked tokens
+      return res.status(401).json({ success: false, message: 'Invalid or revoked refresh token' });
     }
 
     const user = userResult.rows[0];
 
-    // YOUR CONDITION: Block if Google Login user
-    if (user.auth_provider === 'google') {
-      return res.status(400).json({
-        success: false,
-        message: 'This account is linked with Google. You cannot change password here.'
-      });
-    }
+    // 3. Generate new tokens
+    const newAccessToken = generateAccessToken(user);
+    const newRefreshToken = generateRefreshToken(user);
 
-    // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + 10 * 60000); // 10 mins
+    // 4. Update new refresh token in DB
+    await db.query('UPDATE users SET refresh_token = $1 WHERE id = $2', [newRefreshToken, user.id]);
 
-    await db.query(
-      'UPDATE users SET reset_otp = $1, otp_expiry = $2 WHERE id = $3',
-      [otp, expiry, user.id]
-    );
-
-    // Send Email (Configure these in your .env)
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-      }
+    return res.status(200).json({
+      success: true,
+      token: newAccessToken,
+      refreshToken: newRefreshToken
     });
-
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: 'Password Reset OTP - Kharcha App',
-      text: `Your OTP for password reset is: ${otp}. It is valid for 10 minutes.`
-    };
-
-    await transporter.sendMail(mailOptions);
-    return res.status(200).json({ success: true, message: 'OTP sent successfully to your email' });
   } catch (error) {
-    console.error('[forgotPassword] ERROR:', error.message);
-    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+    console.error('[refreshToken] ERROR:', error.message);
+    // Return 401 for expired or invalid token to trigger logout/re-login in app
+    return res.status(401).json({ success: false, message: 'Token expired or invalid' });
   }
 };
 
-// ============================================================
-// VERIFY OTP
-// ============================================================
-exports.verifyOTP = async (req, res) => {
-  const { email, otp } = req.body;
+// Change Password (Direct - No OTP)
+exports.changePasswordDirect = async (req, res) => {
+  const { email, newPassword } = req.body;
   try {
-    const userResult = await db.query(
-      'SELECT * FROM users WHERE email = $1 AND reset_otp = $2 AND otp_expiry > NOW()',
-      [email, otp]
-    );
-
-    if (userResult.rows.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
-    return res.status(200).json({ success: true, message: 'OTP verified successfully' });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
-
-// ============================================================
-// RESET PASSWORD
-// ============================================================
-exports.resetPassword = async (req, res) => {
-  const { email, otp, newPassword } = req.body;
-  try {
-    const userResult = await db.query(
-      'SELECT * FROM users WHERE email = $1 AND reset_otp = $2 AND otp_expiry > NOW()',
-      [email, otp]
-    );
-
-    if (userResult.rows.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    await db.query(
-      'UPDATE users SET password = $1, reset_otp = NULL, otp_expiry = NULL WHERE id = $2',
-      [hashedPassword, userResult.rows[0].id]
+    // Flexible Condition: Allow password change if provider is NOT google
+    const result = await db.query(
+      "UPDATE users SET password = $1 WHERE email = $2 AND (auth_provider != 'google' OR auth_provider IS NULL) RETURNING id",
+      [hashedPassword, email]
     );
 
-    return res.status(200).json({ success: true, message: 'Password reset successful' });
+    if (result.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password cannot be changed. (User not found or is a Google user)'
+      });
+    }
+
+    return res.status(200).json({ success: true, message: 'Password updated successfully' });
   } catch (error) {
-    return res.status(500).json({ success: false, message: 'Server error' });
+    console.log("API ERROR:", error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 };

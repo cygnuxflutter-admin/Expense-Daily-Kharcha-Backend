@@ -37,6 +37,7 @@ app.use('/api/v1/dashboard', require('./routes/dashboard.route'));
 app.use('/api/v1/reports', require('./routes/report.route'));
 app.use('/api/v1/transactions', require('./routes/transaction.route'));
 app.use('/api/v1/history', require('./routes/history.route'));
+app.use('/api/v1/settings', require('./routes/settings.route'));
 
 // Global error handler
 app.use((err, req, res, next) => {

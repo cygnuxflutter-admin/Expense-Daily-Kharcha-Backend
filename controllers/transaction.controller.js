@@ -394,10 +394,12 @@ exports.getTransactionHistory = async (req, res) => {
         const localToday = new Date(today.getTime() - (today.getTimezoneOffset() * 60000));
         targetDateStr = localToday.toISOString().split('T')[0];
       } else if (type === 'yesterday') {
-        const yesterday = new Date();
+        const today = new Date();
+        const yesterday = new Date(today);
         yesterday.setDate(yesterday.getDate() - 1);
         const localYesterday = new Date(yesterday.getTime() - (yesterday.getTimezoneOffset() * 60000));
         targetDateStr = localYesterday.toISOString().split('T')[0];
+        console.log('[getTransactionHistory] Yesterday calculated as:', targetDateStr);
       } else if (date) {
         targetDateStr = date;
       } else {
@@ -484,6 +486,82 @@ exports.getTransactionHistory = async (req, res) => {
     });
   } catch (error) {
     console.error('[getTransactionHistory] ERROR:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+};
+
+// ============================================================
+// SEARCH TRANSACTIONS
+// GET /api/v1/transactions/search?q=keyword
+// ============================================================
+exports.searchTransactions = async (req, res) => {
+  const userId = req.user.id;
+  const { q, search, query, keyword, type } = req.query;
+  const queryText = (q || search || query || keyword || '').trim();
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const offset = (page - 1) * limit;
+
+  console.log(`[searchTransactions] DEBUG - UserID: ${userId}, Query: "${queryText}", Type: ${type || 'all'}`);
+
+  if (!userId) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
+  }
+
+  if (!queryText) {
+    return res.status(200).json({
+      success: true,
+      data: { transactions: [], pagination: { currentPage: page, totalPages: 0, totalRecords: 0, limit, hasMore: false } }
+    });
+  }
+
+  try {
+    const searchQuery = `%${queryText}%`;
+    // Using ILIKE for case-insensitive search and adding OR conditions
+    let whereClause = `WHERE wt.user_id = $1 AND wt.transaction_type != 'initial_balance'
+                       AND (wt.description ILIKE $2 OR COALESCE(c.name, '') ILIKE $2)`;
+    let queryParams = [userId, searchQuery];
+
+    if (type === 'income' || type === 'credit') {
+      whereClause += ` AND wt.transaction_type = 'credit'`;
+    } else if (type === 'expense' || type === 'debit') {
+      whereClause += ` AND wt.transaction_type = 'debit'`;
+    }
+
+    console.log(`[searchTransactions] SQL Where: ${whereClause}`);
+
+    // 1. Get total count
+    const countResult = await db.query(
+      `SELECT COUNT(*) FROM wallet_transactions wt LEFT JOIN categories c ON wt.category_id = c.id ${whereClause}`,
+      queryParams
+    );
+    const totalRecords = parseInt(countResult.rows[0].count) || 0;
+    const totalPages = Math.ceil(totalRecords / limit);
+
+    console.log(`[searchTransactions] Found Total Records: ${totalRecords}`);
+
+    // 2. Get filtered data
+    const result = await db.query(
+      `SELECT wt.*, c.name as category_name, c.icon as category_icon, c.color as category_color,
+              TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as date
+       FROM wallet_transactions wt
+       LEFT JOIN categories c ON wt.category_id = c.id
+       ${whereClause}
+       ORDER BY wt.expense_date DESC, wt.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [userId, searchQuery, limit, offset]
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        transactions: result.rows,
+        pagination: { currentPage: page, totalPages, totalRecords, limit, hasMore: page < totalPages }
+      }
+    });
+  } catch (error) {
+    console.error('[searchTransactions] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
   }
 };

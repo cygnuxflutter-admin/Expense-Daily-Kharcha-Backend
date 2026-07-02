@@ -21,50 +21,60 @@ exports.getDashboardSummary = async (req, res) => {
   }
 
   const today = new Date();
+  const queryMonth = req.query.month ? parseInt(req.query.month) : today.getMonth() + 1;
+  const queryYear = req.query.year ? parseInt(req.query.year) : today.getFullYear();
+
+  const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const currentMonthLabel = `${monthNames[queryMonth - 1]} ${queryYear}`;
+
   const localToday = new Date(today.getTime() - (today.getTimezoneOffset() * 60000));
   const todayString = localToday.toISOString().split('T')[0];
-  const currentMonthId = today.getMonth() + 1;
-  const currentYearId = today.getFullYear();
-  
+
   try {
     // Current Balance from users table
-    const userResult = await db.query("SELECT current_balance FROM users WHERE id = $1", [userId]);
-    const currentBalance = userResult.rows.length > 0 ? parseFloat(userResult.rows[0].current_balance) || 0 : 0;
-    console.log('[getDashboardSummary] currentBalance:', currentBalance);
+    const userResult = await db.query("SELECT current_balance, name FROM users WHERE id = $1", [userId]);
+    const userData = userResult.rows[0];
+    const currentBalance = userData ? parseFloat(userData.current_balance) || 0 : 0;
+    const userName = userData ? userData.name : 'Unknown';
 
-    // Current Month DEBIT total (from wallet_transactions)
+    console.log(`[getDashboardSummary] User: ${userName}, Showing for: ${currentMonthLabel}`);
+
+    // Monthly DEBIT total (Filtered by Query Month/Year)
     const currentMonthResult = await db.query(
       "SELECT COALESCE(SUM(amount), 0) as total FROM wallet_transactions WHERE user_id = $1 AND transaction_type = 'debit' AND EXTRACT(MONTH FROM expense_date) = $2 AND EXTRACT(YEAR FROM expense_date) = $3",
-      [userId, currentMonthId, currentYearId]
+      [userId, queryMonth, queryYear]
     );
     const monthlyExpense = parseFloat(currentMonthResult.rows[0].total) || 0;
-    console.log('[getDashboardSummary] monthlyExpense:', monthlyExpense);
 
-    // Current Year DEBIT total (from wallet_transactions)
-    const currentYearResult = await db.query(
-      "SELECT COALESCE(SUM(amount), 0) as total FROM wallet_transactions WHERE user_id = $1 AND transaction_type = 'debit' AND EXTRACT(YEAR FROM expense_date) = $2",
-      [userId, currentYearId]
-    );
-    const yearlyExpense = parseFloat(currentYearResult.rows[0].total) || 0;
-    console.log('[getDashboardSummary] yearlyExpense:', yearlyExpense);
-
-    // Monthly CREDIT total (income) (from wallet_transactions)
+    // Monthly CREDIT total (Filtered by Query Month/Year)
     const monthlyIncomeResult = await db.query(
       "SELECT COALESCE(SUM(amount), 0) as total FROM wallet_transactions WHERE user_id = $1 AND transaction_type IN ('credit', 'initial_balance') AND EXTRACT(MONTH FROM expense_date) = $2 AND EXTRACT(YEAR FROM expense_date) = $3",
-      [userId, currentMonthId, currentYearId]
+      [userId, queryMonth, queryYear]
     );
     const monthlyIncome = parseFloat(monthlyIncomeResult.rows[0].total) || 0;
-    console.log('[getDashboardSummary] monthlyIncome:', monthlyIncome);
 
-    // Today's DEBIT total (from wallet_transactions)
+    // Yearly INCOME total (For the query year)
+    const yearlyIncomeResult = await db.query(
+      "SELECT COALESCE(SUM(amount), 0) as total FROM wallet_transactions WHERE user_id = $1 AND transaction_type IN ('credit', 'initial_balance') AND EXTRACT(YEAR FROM expense_date) = $2",
+      [userId, queryYear]
+    );
+    const yearlyIncome = parseFloat(yearlyIncomeResult.rows[0].total) || 0;
+
+    // Yearly EXPENSE total (For the query year)
+    const yearlyExpenseResult = await db.query(
+      "SELECT COALESCE(SUM(amount), 0) as total FROM wallet_transactions WHERE user_id = $1 AND transaction_type = 'debit' AND EXTRACT(YEAR FROM expense_date) = $2",
+      [userId, queryYear]
+    );
+    const yearlyExpense = parseFloat(yearlyExpenseResult.rows[0].total) || 0;
+
+    // Today's DEBIT total
     const todayResult = await db.query(
       "SELECT COALESCE(SUM(amount), 0) as total FROM wallet_transactions WHERE user_id = $1 AND transaction_type = 'debit' AND DATE(expense_date) = $2",
       [userId, todayString]
     );
     const todayExpense = parseFloat(todayResult.rows[0].total) || 0;
-    console.log('[getDashboardSummary] todayExpense:', todayExpense);
 
-    // Recent 5 transactions (from wallet_transactions, joined with categories)
+    // Recent 5 transactions (All time)
     const recentTransactions = await db.query(
       `SELECT wt.*, 
               c.name as category_name, c.icon as category_icon, c.color as category_color,
@@ -76,17 +86,17 @@ exports.getDashboardSummary = async (req, res) => {
        LIMIT 5`,
       [userId]
     );
-    console.log('[getDashboardSummary] recentTransactions:', recentTransactions.rows.length);
 
-    console.log('[getDashboardSummary] SENDING RESPONSE');
     return res.status(200).json({
       success: true,
       data: {
+        currentMonthLabel,
         currentBalance,
         todayExpense,
         monthlyExpense,
-        yearlyExpense,
         monthlyIncome,
+        yearlyExpense,
+        yearlyIncome,
         recentTransactions: recentTransactions.rows
       }
     });
