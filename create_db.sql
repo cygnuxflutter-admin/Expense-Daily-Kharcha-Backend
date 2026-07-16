@@ -1,0 +1,2 @@
+DROP DATABASE IF EXISTS "Spend_Track";
+CREATE DATABASE "Spend_Track";
