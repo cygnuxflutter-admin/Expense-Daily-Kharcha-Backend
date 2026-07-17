@@ -432,7 +432,8 @@ exports.getTransactionHistory = async (req, res) => {
     // ========== 3. Fetch Transactions (now with pagination) ==========
     const txQuery = `SELECT wt.id, wt.description as title, wt.amount, 
                             c.name as category_name,
-                            TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as date, 
+                            wt.payment_mode_id,
+                            TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as date,
                             TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as expense_date,
                              CASE WHEN wt.transaction_type = 'credit' THEN 'Credit' ELSE 'Expense' END as type, 
                              wt.description as notes,

@@ -14,7 +14,7 @@ const initDatabase = async () => {
         firebase_uid VARCHAR(255),
         name VARCHAR(100),
         email VARCHAR(100) UNIQUE NOT NULL,
-        mobile VARCHAR(15),
+        mobile VARCHAR(20), -- Increased length for country codes
         password TEXT,
         role VARCHAR(20) DEFAULT 'user',
         photo_url TEXT,
