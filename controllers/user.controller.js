@@ -49,13 +49,14 @@ exports.getProfile = async (req, res) => {
 // Update Profile
 exports.updateProfile = async (req, res) => {
   const id = req.user.id;
-  const { name, phone, photo_url } = req.body;
+  const { name, phone, mobile, photo_url } = req.body;
+  const userMobile = mobile || phone; // Handle both keys
   console.log('[updateProfile] START - id:', id);
 
   try {
     const updatedUser = await db.query(
       'UPDATE users SET name = COALESCE($1, name), mobile = COALESCE($2, mobile), photo_url = COALESCE($3, photo_url) WHERE id = $4 RETURNING *',
-      [name, phone, photo_url, id]
+      [name, userMobile, photo_url, id]
     );
 
     if (updatedUser.rows.length === 0) {
@@ -66,6 +67,29 @@ exports.updateProfile = async (req, res) => {
     return res.status(200).json({ success: true, message: 'Profile updated', data: updatedUser.rows[0] });
   } catch (error) {
     console.error('[updateProfile] ERROR:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+};
+
+// Soft Delete User Account
+exports.deleteAccount = async (req, res) => {
+  const id = req.user.id;
+  console.log('[deleteAccount] START - id:', id);
+
+  try {
+    const result = await db.query(
+      'UPDATE users SET is_deleted = true, is_active = false, deleted_at = NOW() WHERE id = $1 RETURNING id',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    console.log('[deleteAccount] Account soft-deleted for id:', id);
+    return res.status(200).json({ success: true, message: 'Account deleted successfully' });
+  } catch (error) {
+    console.error('[deleteAccount] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
   }
 };

@@ -41,16 +41,12 @@ exports.addTransaction = async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Get current balance from users table
+    // 1. Get current balance from users table (This is the source of truth)
     const userResult = await client.query('SELECT current_balance FROM users WHERE id = $1', [userId]);
     const currentBalance = userResult.rows.length > 0 ? parseFloat(userResult.rows[0].current_balance) || 0 : 0;
 
-    // 2. Calculate opening_balance (= last transaction's closing_balance for this user)
-    const lastTxResult = await client.query(
-      'SELECT closing_balance FROM wallet_transactions WHERE user_id = $1 ORDER BY expense_date DESC, created_at DESC LIMIT 1',
-      [userId]
-    );
-    const openingBalance = lastTxResult.rows.length > 0 ? parseFloat(lastTxResult.rows[0].closing_balance) || 0 : currentBalance;
+    // 2. Use currentBalance as the opening_balance for this new transaction
+    const openingBalance = currentBalance;
 
     // 3. Calculate closing_balance
     let closingBalance;
@@ -182,18 +178,118 @@ exports.deleteTransaction = async (req, res) => {
 };
 
 // ============================================================
+// UPDATE TRANSACTION (Edit Income/Expense)
+// PUT /api/v1/transactions/:id
+// ============================================================
+exports.updateTransaction = async (req, res) => {
+  const userId = req.user.id;
+  const { id } = req.params;
+  const { transaction_type, amount, category_id, payment_mode_id, description, expense_date } = req.body;
+
+  console.log('[updateTransaction] START - userId:', userId, 'txId:', id);
+
+  if (!userId) {
+    return res.status(401).json({ success: false, message: 'User not found' });
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the OLD transaction record
+    const oldTxResult = await client.query(
+      'SELECT * FROM wallet_transactions WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+
+    if (oldTxResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      client.release();
+      return res.status(404).json({ success: false, message: 'Transaction not found' });
+    }
+
+    const oldTx = oldTxResult.rows[0];
+    const oldAmount = parseFloat(oldTx.amount);
+    const oldType = oldTx.transaction_type;
+
+    // 2. REVERSE OLD TRANSACTION EFFECT on current_balance
+    if (oldType === 'credit' || oldType === 'initial_balance') {
+      await client.query('UPDATE users SET current_balance = current_balance - $1 WHERE id = $2', [oldAmount, userId]);
+    } else {
+      await client.query('UPDATE users SET current_balance = current_balance + $1 WHERE id = $2', [oldAmount, userId]);
+    }
+
+    // 3. APPLY NEW TRANSACTION EFFECT on current_balance
+    const newAmount = parseFloat(amount) || oldAmount;
+    const newType = transaction_type || oldType;
+
+    if (newType === 'credit' || newType === 'initial_balance') {
+      await client.query('UPDATE users SET current_balance = current_balance + $1 WHERE id = $2', [newAmount, userId]);
+    } else {
+      await client.query('UPDATE users SET current_balance = current_balance - $1 WHERE id = $2', [newAmount, userId]);
+    }
+
+    // 4. Update the wallet_transactions record
+    const updatedTx = await client.query(
+      `UPDATE wallet_transactions
+       SET transaction_type = $1, amount = $2, category_id = $3, payment_mode_id = $4,
+           description = $5, expense_date = $6
+       WHERE id = $7 AND user_id = $8
+       RETURNING *`,
+      [
+        newType,
+        newAmount,
+        category_id !== undefined ? category_id : oldTx.category_id,
+        payment_mode_id !== undefined ? payment_mode_id : oldTx.payment_mode_id,
+        description !== undefined ? description : oldTx.description,
+        expense_date || oldTx.expense_date,
+        id,
+        userId
+      ]
+    );
+
+    await client.query('COMMIT');
+    console.log('[updateTransaction] COMMITTED successfully');
+
+    return res.status(200).json({ success: true, message: 'Transaction updated successfully', data: updatedTx.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('[updateTransaction] ERROR - ROLLBACK:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================================
 // GET ALL TRANSACTIONS (replaces getExpenses + getCredits)
 // GET /api/v1/transactions/all
 // ============================================================
 exports.getAllTransactions = async (req, res) => {
   const userId = req.user.id;
-  console.log('[getAllTransactions] START - userId:', userId);
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const offset = (page - 1) * limit;
+
+  console.log(`[getAllTransactions] START - userId: ${userId}, page: ${page}, limit: ${limit}`);
 
   if (!userId) {
-    return res.status(200).json({ success: true, data: [] });
+    return res.status(200).json({
+      success: true,
+      data: { transactions: [], pagination: { currentPage: page, totalPages: 0, totalRecords: 0, limit, hasMore: false } }
+    });
   }
 
   try {
+    // 1. Get total count
+    const countResult = await db.query(
+      'SELECT COUNT(*) FROM wallet_transactions WHERE user_id = $1 AND transaction_type != \'initial_balance\'',
+      [userId]
+    );
+    const totalRecords = parseInt(countResult.rows[0].count) || 0;
+    const totalPages = Math.ceil(totalRecords / limit);
+
+    // 2. Get paginated data
     const result = await db.query(
       `SELECT wt.*, 
               c.name as category_name, c.icon as category_icon, c.color as category_color,
@@ -201,11 +297,26 @@ exports.getAllTransactions = async (req, res) => {
        FROM wallet_transactions wt
        LEFT JOIN categories c ON wt.category_id = c.id
        WHERE wt.user_id = $1 AND wt.transaction_type != 'initial_balance'
-       ORDER BY wt.expense_date DESC, wt.created_at DESC`,
-      [userId]
+       ORDER BY wt.expense_date DESC, wt.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
     );
+
     console.log('[getAllTransactions] Found:', result.rows.length, 'transactions');
-    return res.status(200).json({ success: true, data: result.rows });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        transactions: result.rows,
+        pagination: {
+          currentPage: page,
+          totalPages,
+          totalRecords,
+          limit,
+          hasMore: page < totalPages
+        }
+      }
+    });
   } catch (error) {
     console.error('[getAllTransactions] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
@@ -236,8 +347,12 @@ exports.getTransactionHistory = async (req, res) => {
     });
   }
 
-  const { type, date, month, startDate, endDate } = req.query;
-  console.log('[getTransactionHistory] Params - type:', type, 'date:', date, 'month:', month, 'startDate:', startDate, 'endDate:', endDate);
+  const { type, date, month, startDate, endDate, page: queryPage, limit: queryLimit } = req.query;
+  const page = parseInt(queryPage) || 1;
+  const limit = parseInt(queryLimit) || 20;
+  const offset = (page - 1) * limit;
+
+  console.log('[getTransactionHistory] Params - type:', type, 'date:', date, 'month:', month, 'startDate:', startDate, 'endDate:', endDate, 'page:', page, 'limit:', limit);
 
   try {
     // ========== Determine filter mode ==========
@@ -279,10 +394,12 @@ exports.getTransactionHistory = async (req, res) => {
         const localToday = new Date(today.getTime() - (today.getTimezoneOffset() * 60000));
         targetDateStr = localToday.toISOString().split('T')[0];
       } else if (type === 'yesterday') {
-        const yesterday = new Date();
+        const today = new Date();
+        const yesterday = new Date(today);
         yesterday.setDate(yesterday.getDate() - 1);
         const localYesterday = new Date(yesterday.getTime() - (yesterday.getTimezoneOffset() * 60000));
         targetDateStr = localYesterday.toISOString().split('T')[0];
+        console.log('[getTransactionHistory] Yesterday calculated as:', targetDateStr);
       } else if (date) {
         targetDateStr = date;
       } else {
@@ -312,10 +429,11 @@ exports.getTransactionHistory = async (req, res) => {
     let openingBalance = currentBalance - futureNetChange;
     console.log('[getTransactionHistory] openingBalance:', openingBalance);
 
-    // ========== 3. Fetch Transactions (now using expense_date + categories join) ==========
+    // ========== 3. Fetch Transactions (now with pagination) ==========
     const txQuery = `SELECT wt.id, wt.description as title, wt.amount, 
                             c.name as category_name,
-                            TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as date, 
+                            wt.payment_mode_id,
+                            TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as date,
                             TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as expense_date,
                              CASE WHEN wt.transaction_type = 'credit' THEN 'Credit' ELSE 'Expense' END as type, 
                              wt.description as notes,
@@ -323,26 +441,29 @@ exports.getTransactionHistory = async (req, res) => {
                       FROM wallet_transactions wt
                       LEFT JOIN categories c ON wt.category_id = c.id
                       WHERE wt.user_id = $1 ${dateWhereClause} AND wt.transaction_type != 'initial_balance'
-                      ORDER BY wt.expense_date DESC, wt.created_at DESC`;
-    const txResult = await db.query(txQuery, dateParams);
-    const transactions = txResult.rows;
-    console.log('[getTransactionHistory] transactions found:', transactions.length);
+                      ORDER BY wt.expense_date DESC, wt.created_at DESC
+                      LIMIT $${dateParams.length + 1} OFFSET $${dateParams.length + 2}`;
 
-    // ========== 4. Calculate totals ==========
-    let totalCredit = 0;
-    let totalExpense = 0;
-    for (let tx of transactions) {
-      const amt = parseFloat(tx.amount) || 0;
-      if (tx.type === 'Credit') {
-        totalCredit += amt;
-      } else {
-        totalExpense += amt;
-      }
-    }
+    const paginatedParams = [...dateParams, limit, offset];
+    const txResult = await db.query(txQuery, paginatedParams);
+    const transactions = txResult.rows;
+
+    // ========== 4. Calculate totals for the FULL filtered period (not just the page) ==========
+    const totalsQuery = `SELECT
+                            SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE 0 END) as total_credit,
+                            SUM(CASE WHEN transaction_type = 'debit' THEN amount ELSE 0 END) as total_expense,
+                            COUNT(*) as total_records
+                         FROM wallet_transactions wt
+                         WHERE user_id = $1 ${dateWhereClause} AND transaction_type != 'initial_balance'`;
+    const totalsResult = await db.query(totalsQuery, dateParams);
+    const totalCredit = parseFloat(totalsResult.rows[0].total_credit) || 0;
+    const totalExpense = parseFloat(totalsResult.rows[0].total_expense) || 0;
+    const totalRecords = parseInt(totalsResult.rows[0].total_records) || 0;
+    const totalPages = Math.ceil(totalRecords / limit);
 
     let closingBalance = openingBalance + totalCredit - totalExpense;
 
-    console.log('[getTransactionHistory] totalCredit:', totalCredit, 'totalExpense:', totalExpense, 'closingBalance:', closingBalance);
+    console.log('[getTransactionHistory] totalCredit:', totalCredit, 'totalExpense:', totalExpense, 'closingBalance:', closingBalance, 'totalRecords:', totalRecords);
     console.log('[getTransactionHistory] SENDING RESPONSE');
 
     return res.status(200).json({
@@ -354,11 +475,94 @@ exports.getTransactionHistory = async (req, res) => {
         totalCredit,
         totalExpense,
         closingBalance,
-        transactions
+        transactions,
+        pagination: {
+          currentPage: page,
+          totalPages,
+          totalRecords,
+          limit,
+          hasMore: page < totalPages
+        }
       }
     });
   } catch (error) {
     console.error('[getTransactionHistory] ERROR:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+};
+
+// ============================================================
+// SEARCH TRANSACTIONS
+// GET /api/v1/transactions/search?q=keyword
+// ============================================================
+exports.searchTransactions = async (req, res) => {
+  const userId = req.user.id;
+  const { q, search, query, keyword, type } = req.query;
+  const queryText = (q || search || query || keyword || '').trim();
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const offset = (page - 1) * limit;
+
+  console.log(`[searchTransactions] DEBUG - UserID: ${userId}, Query: "${queryText}", Type: ${type || 'all'}`);
+
+  if (!userId) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
+  }
+
+  if (!queryText) {
+    return res.status(200).json({
+      success: true,
+      data: { transactions: [], pagination: { currentPage: page, totalPages: 0, totalRecords: 0, limit, hasMore: false } }
+    });
+  }
+
+  try {
+    const searchQuery = `%${queryText}%`;
+    // Using ILIKE for case-insensitive search and adding OR conditions
+    let whereClause = `WHERE wt.user_id = $1 AND wt.transaction_type != 'initial_balance'
+                       AND (wt.description ILIKE $2 OR COALESCE(c.name, '') ILIKE $2)`;
+    let queryParams = [userId, searchQuery];
+
+    if (type === 'income' || type === 'credit') {
+      whereClause += ` AND wt.transaction_type = 'credit'`;
+    } else if (type === 'expense' || type === 'debit') {
+      whereClause += ` AND wt.transaction_type = 'debit'`;
+    }
+
+    console.log(`[searchTransactions] SQL Where: ${whereClause}`);
+
+    // 1. Get total count
+    const countResult = await db.query(
+      `SELECT COUNT(*) FROM wallet_transactions wt LEFT JOIN categories c ON wt.category_id = c.id ${whereClause}`,
+      queryParams
+    );
+    const totalRecords = parseInt(countResult.rows[0].count) || 0;
+    const totalPages = Math.ceil(totalRecords / limit);
+
+    console.log(`[searchTransactions] Found Total Records: ${totalRecords}`);
+
+    // 2. Get filtered data
+    const result = await db.query(
+      `SELECT wt.*, c.name as category_name, c.icon as category_icon, c.color as category_color,
+              TO_CHAR(wt.expense_date, 'YYYY-MM-DD') as date
+       FROM wallet_transactions wt
+       LEFT JOIN categories c ON wt.category_id = c.id
+       ${whereClause}
+       ORDER BY wt.expense_date DESC, wt.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [userId, searchQuery, limit, offset]
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        transactions: result.rows,
+        pagination: { currentPage: page, totalPages, totalRecords, limit, hasMore: page < totalPages }
+      }
+    });
+  } catch (error) {
+    console.error('[searchTransactions] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
   }
 };
