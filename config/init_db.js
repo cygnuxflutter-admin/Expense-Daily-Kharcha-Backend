@@ -32,8 +32,20 @@ const initDatabase = async () => {
         access_token TEXT,
         refresh_token TEXT,
         token_expiry TIMESTAMP,
-        refresh_token_expiry TIMESTAMP
+        refresh_token_expiry TIMESTAMP,
+        show_ads BOOLEAN DEFAULT TRUE
       );
+    `);
+
+    // --- INCREMENTAL UPDATES (Safe Column Addition) ---
+    // Ensure 'show_ads' exists even if table was created earlier
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='show_ads') THEN
+          ALTER TABLE users ADD COLUMN show_ads BOOLEAN DEFAULT TRUE;
+        END IF;
+      END $$;
     `);
 
     // 2. Categories Table (Aligned with your screenshot)
