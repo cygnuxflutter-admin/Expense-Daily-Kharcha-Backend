@@ -52,6 +52,14 @@ exports.googleLogin = async (req, res) => {
     if (userResult.rows.length > 0) {
       const existingUser = userResult.rows[0];
 
+      // Strict Check: If user registered with email, don't allow Google login
+      if (existingUser.auth_provider === 'email') {
+        return res.status(400).json({
+          success: false,
+          message: 'This account was created with a password. Please login using your email and password.'
+        });
+      }
+
       if (existingUser.is_deleted) return res.status(403).json({ success: false, message: 'Account deleted' });
       if (existingUser.is_active === false) return res.status(403).json({ success: false, message: 'Account deactivated' });
 
@@ -151,6 +159,15 @@ exports.login = async (req, res) => {
     if (userResult.rows.length === 0) return res.status(404).json({ success: false, message: 'User not found' });
 
     const user = userResult.rows[0];
+
+    // Strict Check: If user registered with Google, don't allow Manual login
+    if (user.auth_provider === 'google') {
+      return res.status(400).json({
+        success: false,
+        message: 'This account is registered via Google. Please use Google Sign-In to login.'
+      });
+    }
+
     if (user.is_deleted) return res.status(403).json({ success: false, message: 'Account deleted' });
     if (user.is_active === false) return res.status(403).json({ success: false, message: 'Account deactivated' });
 
