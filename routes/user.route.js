@@ -8,4 +8,7 @@ router.get('/profile', verifyToken, userController.getProfile);
 router.put('/profile', verifyToken, userController.updateProfile);
 router.delete('/profile', verifyToken, userController.deleteAccount);
 
+// Ad Settings (Per-User)
+router.put('/:id/ad-settings', verifyToken, userController.updateAdSettings); // Admin update by ID
+
 module.exports = router;

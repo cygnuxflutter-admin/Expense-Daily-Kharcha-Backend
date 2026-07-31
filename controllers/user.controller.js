@@ -39,7 +39,14 @@ exports.getProfile = async (req, res) => {
     }
 
     console.log('[getProfile] Found user:', user.rows[0].email);
-    return res.status(200).json({ success: true, data: user.rows[0] });
+    const userData = user.rows[0];
+
+    // Handle local photo URL
+    if (userData.photo_url && !userData.photo_url.startsWith('http')) {
+      userData.photo_url = `${process.env.APP_URL || ''}/uploads/${userData.photo_url}`;
+    }
+
+    return res.status(200).json({ success: true, data: userData });
   } catch (error) {
     console.error('[getProfile] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
@@ -64,7 +71,14 @@ exports.updateProfile = async (req, res) => {
     }
 
     console.log('[updateProfile] Updated:', updatedUser.rows[0].email);
-    return res.status(200).json({ success: true, message: 'Profile updated', data: updatedUser.rows[0] });
+    const userData = updatedUser.rows[0];
+
+    // Handle local photo URL
+    if (userData.photo_url && !userData.photo_url.startsWith('http')) {
+      userData.photo_url = `${process.env.APP_URL || ''}/uploads/${userData.photo_url}`;
+    }
+
+    return res.status(200).json({ success: true, message: 'Profile updated', data: userData });
   } catch (error) {
     console.error('[updateProfile] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
@@ -91,5 +105,36 @@ exports.deleteAccount = async (req, res) => {
   } catch (error) {
     console.error('[deleteAccount] ERROR:', error.message);
     return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+};
+
+// Update Ad Settings (Per-User)
+exports.updateAdSettings = async (req, res) => {
+  const { show_ads } = req.body;
+  const userId = req.params.id || req.user.id; // Use ID from URL if provided (Admin), else use logged-in user
+
+  if (show_ads === undefined) {
+    return res.status(400).json({ success: false, message: 'show_ads field is required' });
+  }
+
+  try {
+    const result = await db.query(
+      'UPDATE users SET show_ads = $1 WHERE id = $2 RETURNING id, email, show_ads',
+      [show_ads, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    console.log(`[updateAdSettings] Updated User ${userId}: show_ads = ${show_ads}`);
+    return res.status(200).json({
+      success: true,
+      message: `Ads ${show_ads ? 'enabled' : 'disabled'} for user successfully`,
+      data: result.rows[0]
+    });
+  } catch (error) {
+    console.error('[updateAdSettings] ERROR:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
